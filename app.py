@@ -5,11 +5,15 @@ Run with:  streamlit run app.py
 """
 
 import io
+import os
+import sys
 import time
 from dataclasses import asdict
 
 import pandas as pd
 import streamlit as st
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from scraper import (
     Company,
@@ -225,8 +229,8 @@ if run_button:
 
             scrape_founders_batch(
                 to_scrape,
-                max_workers=10,
-                delay=0.1,
+                max_workers=6,
+                delay=0.2,
                 discover_emails=emails_enabled,
                 progress_callback=_progress,
             )

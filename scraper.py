@@ -7,12 +7,15 @@ import re
 import json
 import time
 import logging
+import threading
 import concurrent.futures
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 from urllib.parse import urlencode, urljoin
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 
 log = logging.getLogger(__name__)
@@ -30,6 +33,29 @@ HEADERS = {
 
 _cached_algolia_params: Optional[dict] = None
 
+_thread_local = threading.local()
+
+
+def _get_session() -> requests.Session:
+    """Return a thread-local session with retry/backoff and connection pooling."""
+    if not hasattr(_thread_local, "session"):
+        session = requests.Session()
+        session.headers.update(HEADERS)
+        retry = Retry(
+            total=3,
+            backoff_factor=1.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET", "POST"],
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(
+            max_retries=retry, pool_connections=20, pool_maxsize=20
+        )
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        _thread_local.session = session
+    return _thread_local.session
+
 
 def _get_algolia_params() -> dict:
     """
@@ -40,7 +66,7 @@ def _get_algolia_params() -> dict:
     if _cached_algolia_params is not None:
         return _cached_algolia_params
 
-    resp = requests.get(f"{YC_BASE}/companies", headers=HEADERS, timeout=15)
+    resp = _get_session().get(f"{YC_BASE}/companies", timeout=15)
     resp.raise_for_status()
 
     match = re.search(r"window\.AlgoliaOpts\s*=\s*(\{[^}]+\})", resp.text)
@@ -132,9 +158,7 @@ def _extract_emails_from_html(html: str) -> set[str]:
 def _fetch_page_safe(url: str, timeout: int = 10) -> Optional[str]:
     """GET a URL and return the text, or None on any error."""
     try:
-        resp = requests.get(
-            url, headers=HEADERS, timeout=timeout, allow_redirects=True
-        )
+        resp = _get_session().get(url, timeout=timeout, allow_redirects=True)
         if resp.ok and "text/html" in resp.headers.get("content-type", ""):
             return resp.text
     except Exception:
@@ -158,13 +182,13 @@ def _discover_emails_for_company(
 
     # Source 2: Company website — homepage + common sub-pages
     if website:
-        homepage_html = _fetch_page_safe(website)
+        homepage_html = _fetch_page_safe(website, timeout=8)
         if homepage_html:
             emails.update(_extract_emails_from_html(homepage_html))
 
-            for path in ("/about", "/contact", "/team", "/about-us", "/contact-us"):
+            for path in ("/about", "/contact", "/team"):
                 sub_url = urljoin(website.rstrip("/") + "/", path.lstrip("/"))
-                sub_html = _fetch_page_safe(sub_url, timeout=8)
+                sub_html = _fetch_page_safe(sub_url, timeout=6)
                 if sub_html:
                     emails.update(_extract_emails_from_html(sub_html))
 
@@ -174,9 +198,8 @@ def _discover_emails_for_company(
         if not username:
             continue
         try:
-            resp = requests.get(
+            resp = _get_session().get(
                 f"https://api.github.com/users/{username}",
-                headers=HEADERS,
                 timeout=8,
             )
             if resp.ok:
@@ -237,7 +260,7 @@ def _assign_emails_to_founders(
 
 def _algolia_post(body: dict) -> dict:
     params = _get_algolia_params()
-    resp = requests.post(ALGOLIA_URL, params=params, json=body, headers=HEADERS, timeout=30)
+    resp = _get_session().post(ALGOLIA_URL, params=params, json=body, timeout=30)
     resp.raise_for_status()
     return resp.json()
 
@@ -540,7 +563,7 @@ def scrape_founders(
     url = f"{YC_BASE}/companies/{slug}"
     for attempt in range(retries + 1):
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=15)
+            resp = _get_session().get(url, timeout=15)
             if resp.status_code == 429:
                 time.sleep(2 ** attempt)
                 continue
@@ -574,10 +597,11 @@ def scrape_founders(
 
 def scrape_founders_batch(
     companies: list[Company],
-    max_workers: int = 8,
-    delay: float = 0.15,
+    max_workers: int = 6,
+    delay: float = 0.2,
     discover_emails: bool = True,
     progress_callback=None,
+    per_company_timeout: int = 90,
 ) -> list[Company]:
     """
     Scrape founder details for a list of companies in parallel.
@@ -602,7 +626,9 @@ def scrape_founders_batch(
         for future in concurrent.futures.as_completed(futures):
             done_count += 1
             try:
-                future.result()
+                future.result(timeout=per_company_timeout)
+            except concurrent.futures.TimeoutError:
+                log.warning("Company scrape timed out after %ds", per_company_timeout)
             except Exception as exc:
                 log.warning("Scrape error: %s", exc)
             if progress_callback:
