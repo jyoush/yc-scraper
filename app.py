@@ -180,6 +180,14 @@ with st.sidebar:
 
     run_button = st.button("🔍  Fetch Data", use_container_width=True, type="primary")
 
+    st.divider()
+    only_with_email = st.toggle(
+        "Only show founders with emails",
+        value=False,
+        key="only_with_email",
+        help="Filter the founders table to only show rows with a discovered email address.",
+    )
+
 # ── main area ────────────────────────────────────────────────────────────────
 
 st.title("YC Founders Explorer")
@@ -263,14 +271,13 @@ if companies:
     with tab_founders:
         founders_df = df[df["Founder Name"] != ""].reset_index(drop=True)
 
-        only_with_email = st.toggle("Only show founders with emails", value=False)
         if only_with_email:
             founders_df = founders_df[founders_df["Email"] != ""].reset_index(drop=True)
 
         if founders_df.empty:
             st.info(
                 "No founders to show. "
-                + ("Try disabling the email filter, or enable " if only_with_email else "Enable ")
+                + ("Try disabling the **Only show founders with emails** filter in the sidebar, or enable " if only_with_email else "Enable ")
                 + "**Scrape founder details** in the sidebar and re-fetch."
             )
         else:
@@ -286,12 +293,14 @@ if companies:
                     "GitHub": st.column_config.LinkColumn("GitHub"),
                 },
             )
+            csv_data = to_csv_bytes(founders_df)
             st.download_button(
                 "📥  Download Founders CSV",
-                data=to_csv_bytes(founders_df),
+                data=csv_data,
                 file_name="yc_founders.csv",
                 mime="text/csv",
                 use_container_width=True,
+                key="dl_founders",
             )
 
     with tab_companies:
@@ -313,6 +322,7 @@ if companies:
             file_name="yc_companies.csv",
             mime="text/csv",
             use_container_width=True,
+            key="dl_companies",
         )
 else:
     st.info("Configure your filters in the sidebar and click **Fetch Data** to get started.")
