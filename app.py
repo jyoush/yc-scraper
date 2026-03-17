@@ -73,7 +73,9 @@ def companies_to_dataframe(companies: list[Company]) -> pd.DataFrame:
                 rows.append({
                     "Founder Name": f.name,
                     "Title": f.title,
+                    "Email": f.email,
                     "LinkedIn": f.linkedin,
+                    "GitHub": f.github,
                     "Company": c.name,
                     "Batch": c.batch,
                     "Status": c.status,
@@ -88,7 +90,9 @@ def companies_to_dataframe(companies: list[Company]) -> pd.DataFrame:
             rows.append({
                 "Founder Name": "",
                 "Title": "",
+                "Email": "",
                 "LinkedIn": "",
+                "GitHub": "",
                 "Company": c.name,
                 "Batch": c.batch,
                 "Status": c.status,
@@ -159,6 +163,12 @@ with st.sidebar:
         help="Fetch individual company pages for founder names, titles, and LinkedIn profiles. Slower but gives you the full picture.",
     )
 
+    discover_emails_toggle = st.toggle(
+        "Discover public emails",
+        value=True,
+        help="Search YC pages, company websites, and GitHub profiles for publicly listed email addresses. Only verified public emails are included.",
+    )
+
     max_companies = st.slider(
         "Max companies to scrape",
         min_value=10,
@@ -194,7 +204,9 @@ if run_button:
 
         if scrape_founders_toggle and companies:
             to_scrape = companies[:max_companies]
-            st.write(f"Scraping founder details for {len(to_scrape)} companies...")
+            emails_enabled = discover_emails_toggle
+            extra = " (with email discovery)" if emails_enabled else ""
+            st.write(f"Scraping founder details{extra} for {len(to_scrape)} companies...")
 
             progress_bar = st.progress(0)
             progress_text = st.empty()
@@ -203,10 +215,21 @@ if run_button:
                 progress_bar.progress(done / total)
                 progress_text.text(f"{done}/{total} companies scraped")
 
-            scrape_founders_batch(to_scrape, max_workers=10, delay=0.1, progress_callback=_progress)
+            scrape_founders_batch(
+                to_scrape,
+                max_workers=10,
+                delay=0.1,
+                discover_emails=emails_enabled,
+                progress_callback=_progress,
+            )
 
             founder_count = sum(len(c.founders) for c in to_scrape)
+            email_count = sum(
+                1 for c in to_scrape for f in c.founders if f.email
+            )
             st.write(f"Found **{founder_count}** founders across {len(to_scrape)} companies.")
+            if emails_enabled:
+                st.write(f"Discovered **{email_count}** public email addresses.")
 
             if len(companies) > max_companies:
                 remaining = companies[max_companies:]
@@ -226,11 +249,12 @@ companies: list[Company] = st.session_state.companies
 if companies:
     df = companies_to_dataframe(companies)
 
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("Companies", df["Company"].nunique())
     col2.metric("Founders", df[df["Founder Name"] != ""].shape[0])
-    col3.metric("Batches", df["Batch"].nunique())
-    col4.metric("Industries", df["Industries"].str.split(", ").explode().nunique())
+    col3.metric("Emails Found", df[df["Email"] != ""].shape[0])
+    col4.metric("Batches", df["Batch"].nunique())
+    col5.metric("Industries", df["Industries"].str.split(", ").explode().nunique())
 
     st.divider()
 
@@ -246,9 +270,11 @@ if companies:
                 use_container_width=True,
                 height=600,
                 column_config={
+                    "Email": st.column_config.TextColumn("Email"),
                     "Website": st.column_config.LinkColumn("Website"),
                     "YC Page": st.column_config.LinkColumn("YC Page"),
                     "LinkedIn": st.column_config.LinkColumn("LinkedIn"),
+                    "GitHub": st.column_config.LinkColumn("GitHub"),
                 },
             )
             st.download_button(
@@ -261,7 +287,7 @@ if companies:
 
     with tab_companies:
         companies_df = df.drop_duplicates(subset=["Company"]).drop(
-            columns=["Founder Name", "Title", "LinkedIn"]
+            columns=["Founder Name", "Title", "Email", "LinkedIn", "GitHub"]
         ).reset_index(drop=True)
         st.dataframe(
             companies_df,

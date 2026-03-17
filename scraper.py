@@ -1,15 +1,16 @@
 """
 YC Founders Scraper — fetches company metadata from the YC Algolia index,
-then scrapes individual company pages for founder details.
+then scrapes individual company pages for founder details and emails.
 """
 
+import re
 import json
 import time
 import logging
 import concurrent.futures
 from dataclasses import dataclass, field, asdict
 from typing import Optional
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urljoin
 
 import requests
 from bs4 import BeautifulSoup
@@ -39,7 +40,6 @@ def _get_algolia_params() -> dict:
     if _cached_algolia_params is not None:
         return _cached_algolia_params
 
-    import re
     resp = requests.get(f"{YC_BASE}/companies", headers=HEADERS, timeout=15)
     resp.raise_for_status()
 
@@ -63,6 +63,8 @@ class Founder:
     title: str
     bio: str = ""
     linkedin: str = ""
+    email: str = ""
+    github: str = ""
 
 
 @dataclass
@@ -80,6 +82,153 @@ class Company:
     long_description: str = ""
     yc_url: str = ""
     founders: list[Founder] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Email discovery
+# ---------------------------------------------------------------------------
+
+_EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
+
+_NOISE_DOMAINS = frozenset([
+    "sentry.io", "algolia.net", "amazonaws.com", "example.com",
+    "wixpress.com", "schema.org", "w3.org", "googleapis.com",
+    "cloudflare.com", "webpack.js", "reactjs.org", "github.com",
+    "googletagmanager.com", "google-analytics.com", "facebook.com",
+    "twitter.com", "gstatic.com", "intercom.io", "segment.io",
+    "segment.com", "hotjar.com", "hubspot.com", "clarity.ms",
+    "pendo.io", "sentry-next.wixpress.com", "ycombinator.com",
+    "gravatar.com", "shields.io", "vercel.app", "herokuapp.com",
+    "netlify.app", "stripe.com", "typeform.com", "mailchimp.com",
+    "sendgrid.net", "postmarkapp.com", "mixpanel.com", "fullstory.com",
+    "crisp.chat", "zendesk.com", "freshdesk.com", "tawk.to",
+])
+
+
+def _is_noise_email(email: str) -> bool:
+    domain = email.split("@")[1].lower()
+    return any(noise in domain for noise in _NOISE_DOMAINS)
+
+
+def _extract_emails_from_html(html: str) -> set[str]:
+    """Pull all plausible email addresses from an HTML page."""
+    soup = BeautifulSoup(html, "lxml")
+    emails: set[str] = set()
+
+    for a in soup.find_all("a", href=True):
+        if a["href"].startswith("mailto:"):
+            addr = a["href"][7:].split("?")[0].strip()
+            if _EMAIL_RE.match(addr):
+                emails.add(addr.lower())
+
+    for match in _EMAIL_RE.finditer(html):
+        addr = match.group()
+        if not addr.endswith((".png", ".jpg", ".svg", ".gif", ".webp", ".css", ".js")):
+            emails.add(addr.lower())
+
+    return {e for e in emails if not _is_noise_email(e)}
+
+
+def _fetch_page_safe(url: str, timeout: int = 10) -> Optional[str]:
+    """GET a URL and return the text, or None on any error."""
+    try:
+        resp = requests.get(
+            url, headers=HEADERS, timeout=timeout, allow_redirects=True
+        )
+        if resp.ok and "text/html" in resp.headers.get("content-type", ""):
+            return resp.text
+    except Exception:
+        pass
+    return None
+
+
+def _discover_emails_for_company(
+    yc_page_html: str,
+    website: str,
+    github_urls: list[str],
+) -> set[str]:
+    """
+    Gather publicly available emails from multiple sources for one company.
+    Returns a set of clean, de-duped email addresses.
+    """
+    emails: set[str] = set()
+
+    # Source 1: YC company page
+    emails.update(_extract_emails_from_html(yc_page_html))
+
+    # Source 2: Company website — homepage + common sub-pages
+    if website:
+        homepage_html = _fetch_page_safe(website)
+        if homepage_html:
+            emails.update(_extract_emails_from_html(homepage_html))
+
+            for path in ("/about", "/contact", "/team", "/about-us", "/contact-us"):
+                sub_url = urljoin(website.rstrip("/") + "/", path.lstrip("/"))
+                sub_html = _fetch_page_safe(sub_url, timeout=8)
+                if sub_html:
+                    emails.update(_extract_emails_from_html(sub_html))
+
+    # Source 3: GitHub org/user profiles via API (public email field)
+    for gh_url in github_urls:
+        username = gh_url.rstrip("/").split("/")[-1]
+        if not username:
+            continue
+        try:
+            resp = requests.get(
+                f"https://api.github.com/users/{username}",
+                headers=HEADERS,
+                timeout=8,
+            )
+            if resp.ok:
+                gh_email = resp.json().get("email")
+                if gh_email and _EMAIL_RE.match(gh_email) and not _is_noise_email(gh_email):
+                    emails.add(gh_email.lower())
+        except Exception:
+            pass
+
+    return emails
+
+
+def _match_email_to_founder(email: str, founder_name: str) -> bool:
+    """
+    Heuristic: does this email likely belong to this founder?
+    Checks if the email local part contains the founder's first or last name.
+    """
+    local = email.split("@")[0].lower().replace(".", " ").replace("_", " ").replace("-", " ")
+    parts = founder_name.lower().split()
+    if not parts:
+        return False
+    first = parts[0]
+    last = parts[-1] if len(parts) > 1 else ""
+    return first in local or (last and last in local)
+
+
+def _assign_emails_to_founders(
+    founders: list[Founder],
+    emails: set[str],
+) -> None:
+    """
+    Try to match discovered emails to specific founders by name.
+    If only one founder and one email, assign directly.
+    Unmatched emails are left unassigned (not forced onto anyone).
+    """
+    if not emails or not founders:
+        return
+
+    remaining = set(emails)
+
+    # Pass 1: assign emails that clearly match a founder's name
+    for founder in founders:
+        for email in list(remaining):
+            if _match_email_to_founder(email, founder.name):
+                founder.email = email
+                remaining.discard(email)
+                break
+
+    # Pass 2: if there's exactly one founder without an email and one remaining email, assign it
+    no_email = [f for f in founders if not f.email]
+    if len(no_email) == 1 and len(remaining) == 1:
+        no_email[0].email = remaining.pop()
 
 
 # ---------------------------------------------------------------------------
@@ -327,12 +476,16 @@ def _parse_founders_from_html(html: str) -> list[Founder]:
                 if name_div:
                     title = _extract_title_near(name_div)
 
+                github = ""
                 for a in card.find_all("a", href=True):
                     href = a.get("href", "")
                     label = a.get("aria-label", "").lower()
                     if "linkedin.com" in href or "linkedin" in label:
-                        linkedin = href if "linkedin.com" in href else ""
-                        break
+                        if not linkedin:
+                            linkedin = href if "linkedin.com" in href else ""
+                    if "github.com" in href or "github" in label:
+                        if not github and "/companies/" not in href:
+                            github = href if "github.com" in href else ""
 
                 bio_div = card.find(
                     "div", class_=lambda c: c and "prose" in c
@@ -343,7 +496,8 @@ def _parse_founders_from_html(html: str) -> list[Founder]:
                 if name not in seen_names:
                     seen_names.add(name)
                     founders.append(Founder(
-                        name=name, title=title, bio=bio, linkedin=linkedin
+                        name=name, title=title, bio=bio,
+                        linkedin=linkedin, github=github,
                     ))
 
     # Fallback: scan all ycdc-card divs for img alts that look like person names
@@ -376,8 +530,13 @@ def _parse_founders_from_html(html: str) -> list[Founder]:
     return founders
 
 
-def scrape_founders(slug: str, retries: int = 2) -> list[Founder]:
-    """Scrape a single company page for founder info."""
+def scrape_founders(
+    slug: str,
+    website: str = "",
+    discover_emails: bool = True,
+    retries: int = 2,
+) -> list[Founder]:
+    """Scrape a single company page for founder info and optionally emails."""
     url = f"{YC_BASE}/companies/{slug}"
     for attempt in range(retries + 1):
         try:
@@ -386,14 +545,26 @@ def scrape_founders(slug: str, retries: int = 2) -> list[Founder]:
                 time.sleep(2 ** attempt)
                 continue
             resp.raise_for_status()
+            html = resp.text
 
-            next_data = _extract_next_data(resp.text)
+            next_data = _extract_next_data(html)
             if next_data:
                 founders = _parse_founders_from_next_data(next_data)
                 if founders:
+                    if discover_emails:
+                        github_urls = [f.github for f in founders if f.github]
+                        emails = _discover_emails_for_company(html, website, github_urls)
+                        _assign_emails_to_founders(founders, emails)
                     return founders
 
-            return _parse_founders_from_html(resp.text)
+            founders = _parse_founders_from_html(html)
+
+            if discover_emails and founders:
+                github_urls = [f.github for f in founders if f.github]
+                emails = _discover_emails_for_company(html, website, github_urls)
+                _assign_emails_to_founders(founders, emails)
+
+            return founders
         except requests.RequestException as exc:
             log.warning("Failed to scrape %s (attempt %d): %s", slug, attempt + 1, exc)
             if attempt < retries:
@@ -405,6 +576,7 @@ def scrape_founders_batch(
     companies: list[Company],
     max_workers: int = 8,
     delay: float = 0.15,
+    discover_emails: bool = True,
     progress_callback=None,
 ) -> list[Company]:
     """
@@ -417,7 +589,11 @@ def scrape_founders_batch(
         idx, company = idx_company
         if delay:
             time.sleep(delay * (idx % max_workers))
-        company.founders = scrape_founders(company.slug)
+        company.founders = scrape_founders(
+            company.slug,
+            website=company.website,
+            discover_emails=discover_emails,
+        )
         return idx
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
