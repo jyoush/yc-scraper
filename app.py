@@ -262,8 +262,17 @@ if companies:
 
     with tab_founders:
         founders_df = df[df["Founder Name"] != ""].reset_index(drop=True)
+
+        only_with_email = st.toggle("Only show founders with emails", value=False)
+        if only_with_email:
+            founders_df = founders_df[founders_df["Email"] != ""].reset_index(drop=True)
+
         if founders_df.empty:
-            st.info("No founder details available. Enable **Scrape founder details** in the sidebar and re-fetch.")
+            st.info(
+                "No founders to show. "
+                + ("Try disabling the email filter, or enable " if only_with_email else "Enable ")
+                + "**Scrape founder details** in the sidebar and re-fetch."
+            )
         else:
             st.dataframe(
                 founders_df,
