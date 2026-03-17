@@ -1,19 +1,20 @@
 """
-YC Founders Explorer — Streamlit web app.
+YC Founders Scraper — CLI tool.
 
-Run with:  streamlit run app.py
+Usage:
+    python app.py                          # all companies, no founder scraping
+    python app.py --batch W25              # filter by batch
+    python app.py --batch S24 --founders   # scrape founder details too
+    python app.py --batch S24 --founders --emails   # + email discovery
+    python app.py --list-batches           # show available batches
+    python app.py --list-industries        # show available industries
 """
 
-import io
-import os
+import argparse
+import csv
+import logging
 import sys
 import time
-from dataclasses import asdict
-
-import pandas as pd
-import streamlit as st
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from scraper import (
     Company,
@@ -23,40 +24,20 @@ from scraper import (
     scrape_founders_batch,
 )
 
-# ── page config ──────────────────────────────────────────────────────────────
+log = logging.getLogger("yc-scraper")
 
-st.set_page_config(
-    page_title="YC Founders Explorer",
-    page_icon="🚀",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
 
-# ── custom CSS ───────────────────────────────────────────────────────────────
+def _setup_logging(verbose: bool) -> None:
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        format="%(asctime)s  %(levelname)-8s  %(message)s",
+        datefmt="%H:%M:%S",
+        level=level,
+        stream=sys.stderr,
+    )
 
-st.markdown("""
-<style>
-    .block-container { padding-top: 1.5rem; }
-    h1 { margin-bottom: 0.2rem; }
-    .stDataFrame { font-size: 0.85rem; }
-    div[data-testid="stMetric"] {
-        background: #f8f9fb; border-radius: 8px;
-        padding: 12px 16px; border: 1px solid #e4e7ec;
-    }
-</style>
-""", unsafe_allow_html=True)
-
-# ── session state ────────────────────────────────────────────────────────────
-
-if "companies" not in st.session_state:
-    st.session_state.companies = []
-if "founders_scraped" not in st.session_state:
-    st.session_state.founders_scraped = False
-
-# ── helpers ──────────────────────────────────────────────────────────────────
 
 def _batch_sort_key(batch: str) -> tuple:
-    """Sort batches reverse-chronologically: F25 > S25 > W25 > S24 ..."""
     season_order = {"F": 0, "S": 1, "W": 2, "IK": 3}
     if not batch:
         return (9999, 9)
@@ -69,264 +50,177 @@ def _batch_sort_key(batch: str) -> tuple:
     return (-num, season_order.get(season, 9))
 
 
-def companies_to_dataframe(companies: list[Company]) -> pd.DataFrame:
-    rows = []
+def list_facets(facet_name: str) -> None:
+    facets = fetch_facets()
+    values = facets.get(facet_name, {})
+    if not values:
+        log.error("No values found for facet %r", facet_name)
+        sys.exit(1)
+
+    if facet_name == "batch":
+        items = sorted(values.items(), key=lambda kv: _batch_sort_key(kv[0]))
+    else:
+        items = sorted(values.items(), key=lambda kv: kv[0])
+
+    print(f"\n{'Value':<30} {'Count':>8}")
+    print("-" * 40)
+    for name, count in items:
+        print(f"{name:<30} {count:>8,}")
+    print(f"\nTotal: {len(items)} values\n")
+
+
+def write_csv(companies: list[Company], out_path: str, with_founders: bool, only_emails: bool = False) -> None:
+    if with_founders:
+        fieldnames = [
+            "company", "batch", "status", "one_liner", "website",
+            "industries", "location", "team_size", "yc_url",
+            "founder_name", "founder_title", "founder_email",
+            "founder_linkedin", "founder_github",
+        ]
+    else:
+        fieldnames = [
+            "company", "batch", "status", "one_liner", "website",
+            "industries", "location", "team_size", "yc_url",
+        ]
+
+    fh = None
+    if out_path != "-":
+        fh = open(out_path, "w", newline="", encoding="utf-8-sig")
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+    else:
+        writer = csv.DictWriter(sys.stdout, fieldnames=fieldnames)
+
+    writer.writeheader()
+
     for c in companies:
-        if c.founders:
-            for f in c.founders:
-                rows.append({
-                    "Founder Name": f.name,
-                    "Title": f.title,
-                    "Email": f.email,
-                    "LinkedIn": f.linkedin,
-                    "GitHub": f.github,
-                    "Company": c.name,
-                    "Batch": c.batch,
-                    "Status": c.status,
-                    "Industries": ", ".join(c.industries),
-                    "One-Liner": c.one_liner,
-                    "Website": c.website,
-                    "Location": c.location,
-                    "Team Size": c.team_size,
-                    "YC Page": c.yc_url,
-                })
+        base = {
+            "company": c.name,
+            "batch": c.batch,
+            "status": c.status,
+            "one_liner": c.one_liner,
+            "website": c.website,
+            "industries": "; ".join(c.industries),
+            "location": c.location,
+            "team_size": c.team_size,
+            "yc_url": c.yc_url,
+        }
+        if with_founders:
+            founders = [f for f in c.founders if f.email] if only_emails else c.founders
+            if founders:
+                for f in founders:
+                    writer.writerow({
+                        **base,
+                        "founder_name": f.name,
+                        "founder_title": f.title,
+                        "founder_email": f.email,
+                        "founder_linkedin": f.linkedin,
+                        "founder_github": f.github,
+                    })
+            elif not only_emails:
+                writer.writerow({**base, "founder_name": "", "founder_title": "",
+                                 "founder_email": "", "founder_linkedin": "", "founder_github": ""})
         else:
-            rows.append({
-                "Founder Name": "",
-                "Title": "",
-                "Email": "",
-                "LinkedIn": "",
-                "GitHub": "",
-                "Company": c.name,
-                "Batch": c.batch,
-                "Status": c.status,
-                "Industries": ", ".join(c.industries),
-                "One-Liner": c.one_liner,
-                "Website": c.website,
-                "Location": c.location,
-                "Team Size": c.team_size,
-                "YC Page": c.yc_url,
-            })
-    return pd.DataFrame(rows)
+            writer.writerow(base)
+
+    if fh:
+        fh.close()
 
 
-def to_csv_bytes(df: pd.DataFrame) -> bytes:
-    buf = io.BytesIO()
-    df.to_csv(buf, index=False, encoding="utf-8-sig")
-    return buf.getvalue()
+def _progress(done: int, total: int) -> None:
+    pct = done * 100 // total
+    bar = "#" * (pct // 2) + "-" * (50 - pct // 2)
+    print(f"\r  [{bar}] {done}/{total} ({pct}%)", end="", file=sys.stderr, flush=True)
+    if done == total:
+        print(file=sys.stderr)
 
 
-# ── sidebar: load facets & build filters ─────────────────────────────────────
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Scrape YC company & founder data to CSV.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument("--batch", type=str, default=None, help="Filter by YC batch (e.g. W25, S24)")
+    parser.add_argument("--industry", type=str, default=None, help="Filter by industry")
+    parser.add_argument("--status", type=str, default=None, help="Filter by status (Active, Acquired, Public, Inactive)")
+    parser.add_argument("--query", type=str, default="", help="Keyword search")
+    parser.add_argument("--founders", action="store_true", help="Scrape individual company pages for founder details")
+    parser.add_argument("--emails", action="store_true", help="Discover public emails (implies --founders)")
+    parser.add_argument("--only-emails", action="store_true", help="Only include founders with a discovered email in the output")
+    parser.add_argument("--max", type=int, default=None, help="Max companies to scrape founders for (default: all)")
+    parser.add_argument("--workers", type=int, default=6, help="Parallel workers for founder scraping (default: 6)")
+    parser.add_argument("-o", "--output", type=str, default="-", help="Output CSV path (default: stdout)")
+    parser.add_argument("--list-batches", action="store_true", help="List all available batches and exit")
+    parser.add_argument("--list-industries", action="store_true", help="List all available industries and exit")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
+    args = parser.parse_args()
 
-st.sidebar.title("Filters")
+    _setup_logging(args.verbose)
 
-with st.sidebar:
-    with st.spinner("Loading filter options..."):
-        try:
-            facets = fetch_facets()
-        except Exception as exc:
-            st.error(f"Could not load facets: {exc}")
-            st.stop()
+    if args.list_batches:
+        list_facets("batch")
+        return
+    if args.list_industries:
+        list_facets("industries")
+        return
 
-    batches_raw: dict = facets.get("batch", {})
-    industries_raw: dict = facets.get("industries", {})
-    statuses_raw: dict = facets.get("status", {})
+    if args.only_emails:
+        args.emails = True
+    if args.emails:
+        args.founders = True
 
-    sorted_batches = sorted(batches_raw.keys(), key=_batch_sort_key)
-    sorted_industries = sorted(industries_raw.keys())
-    sorted_statuses = sorted(statuses_raw.keys())
-
-    selected_batch = st.selectbox(
-        "YC Batch",
-        options=["All"] + sorted_batches,
-        index=0,
-        help="Filter by YC batch (e.g. S21, W24)",
+    log.info("Fetching companies from YC directory...")
+    companies = fetch_companies(
+        batch_filter=args.batch,
+        industry_filter=args.industry,
+        query=args.query,
     )
 
-    selected_industry = st.selectbox(
-        "Industry",
-        options=["All"] + sorted_industries,
-        index=0,
-        help="Filter by primary industry",
-    )
+    if args.status:
+        companies = [c for c in companies if c.status.lower() == args.status.lower()]
 
-    selected_status = st.selectbox(
-        "Company Status",
-        options=["All"] + sorted_statuses,
-        index=0,
-        help="Active, Acquired, Public, Inactive",
-    )
+    log.info("Found %d companies.", len(companies))
 
-    search_query = st.text_input("Keyword search", "", help="Search company names / descriptions")
+    if not companies:
+        log.warning("No companies matched your filters.")
+        sys.exit(0)
 
-    st.divider()
+    if args.founders:
+        to_scrape = companies[:args.max] if args.max else companies
+        action = "founder details + emails" if args.emails else "founder details"
+        log.info("Scraping %s for %d companies (%d workers)...", action, len(to_scrape), args.workers)
 
-    scrape_founders_toggle = st.toggle(
-        "Scrape founder details",
-        value=True,
-        help="Fetch individual company pages for founder names, titles, and LinkedIn profiles. Slower but gives you the full picture.",
-    )
+        t0 = time.perf_counter()
+        scrape_founders_batch(
+            to_scrape,
+            max_workers=args.workers,
+            delay=0.2,
+            discover_emails=args.emails,
+            progress_callback=_progress,
+        )
+        elapsed = time.perf_counter() - t0
 
-    discover_emails_toggle = st.toggle(
-        "Discover public emails",
-        value=True,
-        help="Search YC pages, company websites, and GitHub profiles for publicly listed email addresses. Only verified public emails are included.",
-    )
-
-    max_companies = st.slider(
-        "Max companies to scrape",
-        min_value=10,
-        max_value=2000,
-        value=200,
-        step=10,
-        help="Limit the number of companies to scrape founder details for (to control speed).",
-    )
-
-    run_button = st.button("🔍  Fetch Data", use_container_width=True, type="primary")
-
-    st.divider()
-    only_with_email = st.toggle(
-        "Only show founders with emails",
-        value=False,
-        key="only_with_email",
-        help="Filter the founders table to only show rows with a discovered email address.",
-    )
-
-# ── main area ────────────────────────────────────────────────────────────────
-
-st.title("YC Founders Explorer")
-st.caption("Search and export Y Combinator founder & company data with filters for batch, industry, and more.")
-
-if run_button:
-    batch_arg = None if selected_batch == "All" else selected_batch
-    industry_arg = None if selected_industry == "All" else selected_industry
-
-    with st.status("Fetching companies from YC directory...", expanded=True) as status:
-        st.write("Querying Algolia index...")
-        companies = fetch_companies(
-            batch_filter=batch_arg,
-            industry_filter=industry_arg,
-            query=search_query,
+        founder_count = sum(len(c.founders) for c in to_scrape)
+        email_count = sum(1 for c in to_scrape for f in c.founders if f.email)
+        log.info(
+            "Done in %.1fs — %d founders, %d emails across %d companies.",
+            elapsed, founder_count, email_count, len(to_scrape),
         )
 
-        if selected_status != "All":
-            companies = [c for c in companies if c.status == selected_status]
+        if args.max and len(companies) > args.max:
+            companies = to_scrape + companies[args.max:]
 
-        st.write(f"Found **{len(companies)}** companies matching your filters.")
+    out = args.output
+    if out == "-":
+        log.info("Writing CSV to stdout...")
+    else:
+        log.info("Writing CSV to %s...", out)
 
-        if scrape_founders_toggle and companies:
-            to_scrape = companies[:max_companies]
-            emails_enabled = discover_emails_toggle
-            extra = " (with email discovery)" if emails_enabled else ""
-            st.write(f"Scraping founder details{extra} for {len(to_scrape)} companies...")
+    write_csv(companies, out, with_founders=args.founders, only_emails=args.only_emails)
 
-            progress_bar = st.progress(0)
-            progress_text = st.empty()
+    if out != "-":
+        log.info("Saved %s", out)
 
-            def _progress(done, total):
-                progress_bar.progress(done / total)
-                progress_text.text(f"{done}/{total} companies scraped")
 
-            scrape_founders_batch(
-                to_scrape,
-                max_workers=6,
-                delay=0.2,
-                discover_emails=emails_enabled,
-                progress_callback=_progress,
-            )
-
-            founder_count = sum(len(c.founders) for c in to_scrape)
-            email_count = sum(
-                1 for c in to_scrape for f in c.founders if f.email
-            )
-            st.write(f"Found **{founder_count}** founders across {len(to_scrape)} companies.")
-            if emails_enabled:
-                st.write(f"Discovered **{email_count}** public email addresses.")
-
-            if len(companies) > max_companies:
-                remaining = companies[max_companies:]
-                companies = to_scrape + remaining
-            else:
-                companies = to_scrape
-
-        status.update(label="Done!", state="complete")
-
-    st.session_state.companies = companies
-    st.session_state.founders_scraped = scrape_founders_toggle
-
-# ── display results ──────────────────────────────────────────────────────────
-
-companies: list[Company] = st.session_state.companies
-
-if companies:
-    df = companies_to_dataframe(companies)
-
-    col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("Companies", df["Company"].nunique())
-    col2.metric("Founders", df[df["Founder Name"] != ""].shape[0])
-    col3.metric("Emails Found", df[df["Email"] != ""].shape[0])
-    col4.metric("Batches", df["Batch"].nunique())
-    col5.metric("Industries", df["Industries"].str.split(", ").explode().nunique())
-
-    st.divider()
-
-    tab_founders, tab_companies = st.tabs(["Founders View", "Companies View"])
-
-    with tab_founders:
-        founders_df = df[df["Founder Name"] != ""].reset_index(drop=True)
-
-        if only_with_email:
-            founders_df = founders_df[founders_df["Email"] != ""].reset_index(drop=True)
-
-        if founders_df.empty:
-            st.info(
-                "No founders to show. "
-                + ("Try disabling the **Only show founders with emails** filter in the sidebar, or enable " if only_with_email else "Enable ")
-                + "**Scrape founder details** in the sidebar and re-fetch."
-            )
-        else:
-            st.dataframe(
-                founders_df,
-                use_container_width=True,
-                height=600,
-                column_config={
-                    "Email": st.column_config.TextColumn("Email"),
-                    "Website": st.column_config.LinkColumn("Website"),
-                    "YC Page": st.column_config.LinkColumn("YC Page"),
-                    "LinkedIn": st.column_config.LinkColumn("LinkedIn"),
-                    "GitHub": st.column_config.LinkColumn("GitHub"),
-                },
-            )
-            csv_data = to_csv_bytes(founders_df)
-            st.download_button(
-                "📥  Download Founders CSV",
-                data=csv_data,
-                file_name="yc_founders.csv",
-                mime="text/csv",
-                use_container_width=True,
-                key="dl_founders",
-            )
-
-    with tab_companies:
-        companies_df = df.drop_duplicates(subset=["Company"]).drop(
-            columns=["Founder Name", "Title", "Email", "LinkedIn", "GitHub"]
-        ).reset_index(drop=True)
-        st.dataframe(
-            companies_df,
-            use_container_width=True,
-            height=600,
-            column_config={
-                "Website": st.column_config.LinkColumn("Website"),
-                "YC Page": st.column_config.LinkColumn("YC Page"),
-            },
-        )
-        st.download_button(
-            "📥  Download Companies CSV",
-            data=to_csv_bytes(companies_df),
-            file_name="yc_companies.csv",
-            mime="text/csv",
-            use_container_width=True,
-            key="dl_companies",
-        )
-else:
-    st.info("Configure your filters in the sidebar and click **Fetch Data** to get started.")
+if __name__ == "__main__":
+    main()
